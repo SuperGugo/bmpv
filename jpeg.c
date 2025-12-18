@@ -119,7 +119,7 @@ int readSegment(FILE *fptr)
         // SOF
         printf("SOF - %d\n", len);
 
-        JFIF_SOF *sof = malloc(sizeof(JFIF_DQT));
+        JFIF_SOF *sof = malloc(sizeof(JFIF_SOF));
         fread(sof, 1, sizeof(JFIF_SOF), fptr);
 
         j_sof = sof;
@@ -205,6 +205,74 @@ int decode_huffman(int table)
     return symbol;
 }
 
+int sign(uint32_t v, int s)
+{
+    if (s == 0)
+        return 0;
+    uint32_t vt = 1u << (s - 1);
+    if (v & vt)
+        return v;
+    return v - ((1u << s) - 1);
+}
+
+uint32_t coefficients[64];
+uint32_t zigzag[64];
+
+void parse_block(int dc, int ac)
+{
+    int old_dc = coefficients[0];
+    for (int i = 0; i < 64; ++i) coefficients[i] = 0;
+
+    uint32_t dc_delta = 0;
+    int dc_size = decode_huffman(dc);
+
+    // read dc_size bits
+    for (int i = 0; i < dc_size; ++i)
+    {
+        dc_delta = (dc_delta << 1) | read_bit();
+    }
+
+    dc_delta = sign(dc_delta, dc_size);
+    int dc_offset = old_dc + dc_delta;
+    coefficients[0] = dc_offset;
+
+    //printf("size: %d, dcoffset: %d\n", dc_size, dc_offset);
+
+    int index = 0;
+    while (index < 64)
+    {
+        uint32_t ac_symbol = decode_huffman(ac);
+        int rl = ac_symbol >> 4;
+        int eb = ac_symbol & 0xF;
+
+        if (rl == 0 && eb == 0)
+        {
+            //printf("eob, totc: %d\n", index);
+            break;
+        }
+
+        uint32_t acoffset = 0;
+        for (int i = 0; i < eb; ++i)
+        {
+            acoffset = (acoffset << 1) | read_bit();
+        }
+        acoffset = sign(acoffset, eb);
+
+        index += rl;
+        index++;
+        coefficients[index] = acoffset;
+        //printf("rl: %d, eb: %d, acoffset: %d, totc: %d\n", rl, eb, acoffset, index);
+    }
+}
+
+// yeah whatever sure
+void translate_zigzag() {
+    int i, j, n;
+    for (i = n = 0; i < 8 * 2; i++)
+        for (j = (i < 8) ? 0 : i-8+1; j <= i && j < 8; j++)
+            zigzag[(i&1)? j*(8-1)+i : (i-j)*8+j ] = coefficients[n++];
+}
+
 int main(int argc, char **argv)
 {
 
@@ -220,8 +288,7 @@ int main(int argc, char **argv)
     j_dqt = malloc(sizeof(JFIF_DQT *) * 16); // arbitrary numbers for now
     j_dht = malloc(sizeof(JFIF_DHT *) * 16);
 
-    while (!readSegment(fptr))
-        ;
+    while (!readSegment(fptr));
 
     int len = 8;
     int out = 0;
@@ -258,7 +325,7 @@ int main(int argc, char **argv)
     printf("%d\n", j_sof->width);
     printf("%d\n", j_sof->components[2].table);
 
-    j_codelens = malloc(j_dht_len * sizeof(uint32_t *));
+    j_codelens = malloc(j_dht_len * sizeof(uint32_t));
     j_codes = malloc(j_dht_len * sizeof(uint16_t *));
     j_lengths = malloc(j_dht_len * sizeof(uint16_t *));
     j_symbols = malloc(j_dht_len * sizeof(uint16_t *));
@@ -305,11 +372,14 @@ int main(int argc, char **argv)
     printf("\nsos %d", j_sos->components[1].table);
     printf("\nsos %d\n", j_sos->components[2].table);
 
-    for (int i = 0; i < 1; i++)
+    readbit_offset = 0;
+    readbit_ptr = j_entropyData;
+    for (int i = 0; i < 3; i++)
     {
         int blocks = (j_sof->components[i].factor >> 4) * (j_sof->components[i].factor & 0x0F);
         int dc = find_ht(0, j_sos->components[i].table >> 4);
         int ac = find_ht(1, j_sos->components[i].table & 0x0F);
+        int quant = j_sof->components[i].table;
 
         printf("\n");
         for (int j = 0; j < j_codelens[dc]; ++j)
@@ -318,32 +388,27 @@ int main(int argc, char **argv)
         }
         printf("\n");
 
-        uint32_t dcoffset = 0;
-        readbit_offset = 0;
-        readbit_ptr = j_entropyData;
-        int symbol = decode_huffman(dc);
-        for (int i = 0; i < symbol; ++i)
-        {
-            dcoffset = (dcoffset << 1) | read_bit();
+        coefficients[0] = 0;
+        for (int b = 0; b < blocks; b++) {
+            parse_block(dc, ac);
+            //for (int j = 0; j < 64; j++) printf("%d ",coefficients[j]);printf("\n");
+
+            translate_zigzag();
+            for (int y = 0; y < 8; y++) {
+                for (int x = 0; x < 8; x++)
+                    printf("%d\t",zigzag[y*8 + x]);
+                printf("\n");
+            }
+            printf("\n");
         }
-        if (symbol > 0 && (dcoffset & (1 << (symbol - 1))) == 0)
-        dcoffset -= (1 << symbol) - 1;
-        printf("symbol: %d, dcoffset: %d\n", symbol, dcoffset);
-
-        symbol = decode_huffman(ac);
-        int rl = symbol >> 4;
-        int eb = symbol & 0xF;
-        uint32_t acoffset1 = 0;
-        for (int i = 0; i < eb; ++i)
-        {
-            acoffset1 = (acoffset1 << 1) | read_bit();
+      
+        printf("QUANTIZATION TABLE:\n---\n");
+        for (int y = 0; y < 8; y++) {
+            for (int x = 0; x < 8; x++)
+                printf("%d\t",j_dqt[quant]->table[y*8 + x]);
+            printf("\n");
         }
-        if (eb > 0 && (acoffset1 & (1 << (eb-1))) == 0)
-        acoffset1 -= (1 << eb) - 1;
-
-        printf("acoffset1: %d", acoffset1);
-
-        // printf("%d ", j_entropyData[i]);
+        printf("---\n");
     }
 
     fclose(fptr);
